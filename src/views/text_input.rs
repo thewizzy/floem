@@ -566,6 +566,15 @@ impl TextInput {
                 }
             }
             Key::Named(NamedKey::Delete) => {
+                let selection = self.selection.clone();
+                if let Some(selection) = selection {
+                    self.cursor_glyph_idx = selection.start;
+                    self.buffer
+                        .update(|buf| replace_range(buf, selection, None));
+                    self.selection = None;
+                    return true;
+                }
+
                 let prev_cursor_idx = self.cursor_glyph_idx;
 
                 if event.modifiers.contains(ModifiersState::CONTROL) {
@@ -781,6 +790,37 @@ impl View for TextInput {
                         ))
                         .index;
                 }
+                true
+            }
+            Event::PointerUp(event) => {
+                let layout = cx.get_layout(self.id()).unwrap();
+                let style = cx.app_state.get_builtin_style(self.id());
+
+                let padding_left = match style.padding_left() {
+                    PxPct::Px(padding) => padding as f32,
+                    PxPct::Pct(pct) => pct as f32 * layout.size.width,
+                };
+                let padding_top = match style.padding_top() {
+                    PxPct::Px(padding) => padding as f32,
+                    PxPct::Pct(pct) => pct as f32 * layout.size.width,
+                };
+                let selection_stop = self
+                    .text_buf
+                    .as_ref()
+                    .unwrap()
+                    .hit_point(Point::new(
+                        event.pos.x + self.clip_start_x - padding_left as f64,
+                        // TODO: prevent cursor incorrectly going to end of buffer when clicking
+                        // slightly below the text
+                        event.pos.y - padding_top as f64,
+                    ))
+                    .index;
+                if selection_stop < self.cursor_glyph_idx{
+                    self.selection = Some(Range{start:selection_stop, end:self.cursor_glyph_idx});
+                } else {
+                    self.selection = Some(Range { start: self.cursor_glyph_idx, end: selection_stop });
+                }
+                self.cursor_glyph_idx = selection_stop;
                 true
             }
             Event::KeyDown(event) => self.handle_key_down(cx, event),
