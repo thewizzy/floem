@@ -1,10 +1,11 @@
 use crate::action::exec_after;
 use crate::keyboard::{self, KeyEvent};
 use crate::reactive::{create_effect, RwSignal};
-use crate::style::{CursorStyle, TextColor, Width};
+use crate::style::{CursorStyle, FontStyle, FontWeight, TextColor};
 use crate::style::{FontProps, PaddingLeft};
 use crate::unit::{PxPct, PxPctAuto};
 use crate::view::ViewData;
+use crate::widgets::PlaceholderTextClass;
 use crate::{prop_extracter, EventPropagation};
 use clipboard::{ClipboardContext, ClipboardProvider};
 use taffy::prelude::{Layout, Node};
@@ -38,6 +39,15 @@ prop_extracter! {
     }
 }
 
+prop_extracter! {
+    PlaceholderStyle {
+        pub color: TextColor,
+        //TODO: pub font_size: FontSize,
+        pub font_weight: FontWeight,
+        pub font_style: FontStyle,
+    }
+}
+
 enum InputKind {
     SingleLine,
     #[allow(unused)]
@@ -51,6 +61,9 @@ enum InputKind {
 pub struct TextInput {
     data: ViewData,
     buffer: RwSignal<String>,
+    pub(crate) placeholder_text: Option<String>,
+    placeholder_buff: Option<TextLayout>,
+    placeholder_style: PlaceholderStyle,
     // Where are we in the main buffer
     cursor_glyph_idx: usize,
     // This can be retrieved from the glyph, but we store it for efficiency
@@ -109,6 +122,9 @@ pub fn text_input(buffer: RwSignal<String>) -> TextInput {
     TextInput {
         data: ViewData::new(id),
         cursor_glyph_idx: 0,
+        placeholder_text: None,
+        placeholder_buff: None,
+        placeholder_style: Default::default(),
         buffer,
         text_buf: None,
         text_node: None,
@@ -385,6 +401,29 @@ impl TextInput {
 
     fn font_size(&self) -> f32 {
         self.font.size().unwrap_or(DEFAULT_FONT_SIZE)
+    }
+
+    pub fn get_placeholder_text_attrs(&self) -> AttrsList {
+        let mut attrs = Attrs::new().color(self.placeholder_style.color().unwrap_or(Color::BLACK));
+
+        //TODO:
+        // self.placeholder_style
+        //     .font_size()
+        //     .unwrap_or(self.font_size())
+        attrs = attrs.font_size(self.font_size());
+
+        if let Some(font_style) = self.placeholder_style.font_style() {
+            attrs = attrs.style(font_style);
+        } else if let Some(font_style) = self.font.style() {
+            attrs = attrs.style(font_style);
+        }
+
+        if let Some(font_weight) = self.placeholder_style.font_weight() {
+            attrs = attrs.weight(font_weight);
+        } else if let Some(font_weight) = self.font.weight() {
+            attrs = attrs.weight(font_weight);
+        }
+        AttrsList::new(attrs)
     }
 
     pub fn get_text_attrs(&self) -> AttrsList {
@@ -693,6 +732,18 @@ impl TextInput {
             self.selection = Some(new_selection);
         }
     }
+
+    fn paint_placeholder_text(
+        &self,
+        placeholder_buff: &TextLayout,
+        cx: &mut crate::context::PaintCx,
+    ) {
+        let text_node = self.text_node.unwrap();
+        let layout = *cx.app_state.taffy.layout(text_node).unwrap();
+        let node_location = layout.location;
+        let text_start_point = Point::new(node_location.x as f64, node_location.y as f64);
+        cx.draw_text(placeholder_buff, text_start_point);
+    }
 }
 
 fn replace_range(buff: &mut String, del_range: Range<usize>, replacement: Option<&str>) {
@@ -743,7 +794,7 @@ impl View for TextInput {
         if state.downcast::<String>().is_ok() {
             cx.request_layout(self.id());
         } else {
-            dbg!("downcast failed");
+            eprintln!("downcast failed");
         }
     }
 
@@ -843,6 +894,7 @@ impl View for TextInput {
     }
 
     fn style(&mut self, cx: &mut crate::context::StyleCx<'_>) {
+        let style = cx.style();
         if self.font.read(cx) || self.text_buf.is_none() {
             self.update_text_layout();
             cx.app_state_mut().request_layout(self.id());
@@ -850,6 +902,9 @@ impl View for TextInput {
         if self.style.read(cx) {
             cx.app_state_mut().request_paint(self.id());
         }
+
+        let placeholder_style = style.clone().apply_class(PlaceholderTextClass);
+        self.placeholder_style.read_style(cx, &placeholder_style);
     }
 
     fn layout(&mut self, cx: &mut crate::context::LayoutCx) -> taffy::prelude::Node {
@@ -865,23 +920,46 @@ impl View for TextInput {
                 );
             }
 
-            let layout = cx.app_state.get_layout(self.id()).unwrap();
-            let style = cx.app_state.get_computed_style(self.id());
-            let style_width = &style.get(Width);
-
             let text_node = self.text_node.unwrap();
+
+            let layout = cx.app_state.get_layout(self.id()).unwrap();
+            let style = cx.app_state_mut().get_builtin_style(self.id());
+            let node_width = layout.size.width;
+
+            if self.placeholder_buff.is_none() {
+                if let Some(placeholder_text) = &self.placeholder_text {
+                    let mut placeholder_buff = TextLayout::new();
+                    let attrs_list = self.get_placeholder_text_attrs();
+                    placeholder_buff.set_text(placeholder_text, attrs_list);
+                    self.placeholder_buff = Some(placeholder_buff);
+                }
+            }
+
+            let style_width = style.width();
             let width_px = match style_width {
-                crate::unit::PxPctAuto::Px(px) => *px as f32,
-                crate::unit::PxPctAuto::Pct(pct) => layout.size.width * (*pct as f32),
+                crate::unit::PxPctAuto::Px(px) => px as f32,
+                crate::unit::PxPctAuto::Pct(pct) => pct as f32 / 100.0 * node_width,
                 crate::unit::PxPctAuto::Auto => {
                     APPROX_VISIBLE_CHARS_TARGET * self.glyph_max_size.width as f32
                 }
             };
             self.is_auto_width = matches!(style_width, PxPctAuto::Auto);
-            self.width = width_px;
+
+            let padding_left = match style.padding_left() {
+                PxPct::Px(padding) => padding as f32,
+                PxPct::Pct(pct) => pct as f32 / 100.0 * node_width,
+            };
+            let padding_right = match style.padding_right() {
+                PxPct::Px(padding) => padding as f32,
+                PxPct::Pct(pct) => pct as f32 / 100.0 * node_width,
+            };
+            let padding = padding_left + padding_right;
+            let borders = (style.border_left().0 + style.border_right().0) as f32;
+
+            self.width = f32::max(width_px - (padding + borders), 1.0);
 
             let style = Style::new()
-                .width(width_px)
+                .width(self.width)
                 .height(self.height)
                 .to_taffy_style();
             let _ = cx.app_state_mut().taffy.set_style(text_node, style);
@@ -899,6 +977,9 @@ impl View for TextInput {
         if !cx.app_state.is_focused(&self.id())
             && self.buffer.with_untracked(|buff| buff.is_empty())
         {
+            if let Some(placeholder_buff) = &self.placeholder_buff {
+                self.paint_placeholder_text(placeholder_buff, cx);
+            }
             return;
         }
 
@@ -960,12 +1041,12 @@ impl View for TextInput {
         let style = cx.app_state.get_computed_style(self.id());
 
         let padding_left = match style.get(PaddingLeft) {
-            PxPct::Px(padding) => padding as f32,
-            PxPct::Pct(pct) => pct as f32 * node_layout.size.width,
+            PxPct::Px(padding) => padding,
+            PxPct::Pct(pct) => pct / 100.0 * node_width,
         };
 
         if cx.app_state.is_focused(&self.id()) {
-            let selection_rect = self.get_selection_rect(&node_layout, padding_left as f64);
+            let selection_rect = self.get_selection_rect(&node_layout, padding_left);
             cx.fill(
                 &selection_rect,
                 cursor_color.unwrap_or(Color::rgba8(0, 0, 0, 150)),
