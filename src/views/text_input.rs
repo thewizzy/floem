@@ -93,6 +93,8 @@ pub struct TextInput {
     cursor_width: f64, // TODO: make this configurable
     is_focused: bool,
     last_cursor_action_on: Instant,
+    // Is the Pointer held down.
+    held: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +147,7 @@ pub fn text_input(buffer: RwSignal<String>) -> TextInput {
         height: 0.0,
         is_focused: false,
         last_cursor_action_on: Instant::now(),
+        held: false,
     }
     .keyboard_navigatable()
 }
@@ -333,7 +336,30 @@ impl TextInput {
             ),
         )
     }
+    fn get_box_position(&self, pos_x: f64, pos_y: f64, cx: &mut EventCx) -> usize {
+        // Already focused - move cursor to click pos
+        let layout = cx.get_layout(self.id()).unwrap();
+        let style = cx.app_state.get_builtin_style(self.id());
 
+        let padding_left = match style.padding_left() {
+            PxPct::Px(padding) => padding as f32,
+            PxPct::Pct(pct) => pct as f32 * layout.size.width,
+        };
+        let padding_top = match style.padding_top() {
+            PxPct::Px(padding) => padding as f32,
+            PxPct::Pct(pct) => pct as f32 * layout.size.width,
+        };
+        self.text_buf
+            .as_ref()
+            .unwrap()
+            .hit_point(Point::new(
+                pos_x + self.clip_start_x - padding_left as f64,
+                // TODO: prevent cursor incorrectly going to end of buffer when clicking
+                // slightly below the text
+                pos_y - padding_top as f64,
+            ))
+            .index
+    }
     fn get_selection_rect(&self, node_layout: &Layout, left_padding: f64) -> Rect {
         let selection = if let Some(curr_selection) = &self.selection {
             curr_selection
@@ -374,6 +400,13 @@ impl TextInput {
         tmp.size()
     }
 
+    fn update_selection(&mut self, selection_start: usize, selection_stop: usize) {
+        if selection_stop < selection_start {
+            self.selection = Some(Range{start:selection_stop, end:selection_start});
+        } else {
+            self.selection = Some(Range { start: selection_start, end: selection_stop });
+        }
+    }
     fn update_text_layout(&mut self) {
         let mut text_layout = TextLayout::new();
         let attrs_list = self.get_text_attrs();
@@ -817,71 +850,35 @@ impl View for TextInput {
                     // Just gained focus - move cursor to buff end
                     self.cursor_glyph_idx = self.buffer.with_untracked(|buff| buff.len());
                 } else {
-                    // Already focused - move cursor to click pos
-                    let layout = cx.get_layout(self.id()).unwrap();
-                    let style = cx.app_state.get_builtin_style(self.id());
-
-                    let padding_left = match style.padding_left() {
-                        PxPct::Px(padding) => padding as f32,
-                        PxPct::Pct(pct) => pct as f32 * layout.size.width,
-                    };
-                    let padding_top = match style.padding_top() {
-                        PxPct::Px(padding) => padding as f32,
-                        PxPct::Pct(pct) => pct as f32 * layout.size.width,
-                    };
-                    self.cursor_glyph_idx = self
-                        .text_buf
-                        .as_ref()
-                        .unwrap()
-                        .hit_point(Point::new(
-                            event.pos.x + self.clip_start_x - padding_left as f64,
-                            // TODO: prevent cursor incorrectly going to end of buffer when clicking
-                            // slightly below the text
-                            event.pos.y - padding_top as f64,
-                        ))
-                        .index;
+                    cx.update_active(self.id());
+                    cx.app_state_mut().request_layout(self.id());
+                    self.held = true;
+                    self.cursor_glyph_idx = self.get_box_position(event.pos.x, event.pos.y, cx);
                 }
                 true
             }
             Event::PointerUp(event) => {
-                let layout = cx.get_layout(self.id()).unwrap();
-                let style = cx.app_state.get_builtin_style(self.id());
-
-                let padding_left = match style.padding_left() {
-                    PxPct::Px(padding) => padding as f32,
-                    PxPct::Pct(pct) => pct as f32 * layout.size.width,
-                };
-                let padding_top = match style.padding_top() {
-                    PxPct::Px(padding) => padding as f32,
-                    PxPct::Pct(pct) => pct as f32 * layout.size.width,
-                };
-                let selection_stop = self
-                    .text_buf
-                    .as_ref()
-                    .unwrap()
-                    .hit_point(Point::new(
-                        event.pos.x + self.clip_start_x - padding_left as f64,
-                        // TODO: prevent cursor incorrectly going to end of buffer when clicking
-                        // slightly below the text
-                        event.pos.y - padding_top as f64,
-                    ))
-                    .index;
-                if selection_stop < self.cursor_glyph_idx{
-                    self.selection = Some(Range{start:selection_stop, end:self.cursor_glyph_idx});
-                } else {
-                    self.selection = Some(Range { start: self.cursor_glyph_idx, end: selection_stop });
+                cx.app_state_mut().request_layout(self.id());
+                if self.held {
+                    let new_position = self.get_box_position(event.pos.x, event.pos.y, cx);
+                    self.update_selection(self.cursor_glyph_idx, new_position);
                 }
-                self.cursor_glyph_idx = selection_stop;
+                self.held = false;
                 true
             }
             Event::KeyDown(event) => self.handle_key_down(cx, event),
-            Event::PointerMove(_) => {
+            Event::PointerMove(event) => {
+                cx.app_state_mut().request_layout(self.id());
+                if self.held {
+                    let selection_stop = self.get_box_position(event.pos.x, event.pos.y, cx);
+                    self.update_selection(self.cursor_glyph_idx, selection_stop);
+                }
                 if !matches!(cx.app_state.cursor, Some(CursorStyle::Text)) {
                     cx.app_state.cursor = Some(CursorStyle::Text);
                     return EventPropagation::Continue;
                 }
                 false
-            }
+            },
             _ => false,
         };
 
