@@ -402,9 +402,15 @@ impl TextInput {
 
     fn update_selection(&mut self, selection_start: usize, selection_stop: usize) {
         if selection_stop < selection_start {
-            self.selection = Some(Range{start:selection_stop, end:selection_start});
+            self.selection = Some(Range {
+                start: selection_stop,
+                end: selection_start,
+            });
         } else {
-            self.selection = Some(Range { start: selection_start, end: selection_stop });
+            self.selection = Some(Range {
+                start: selection_start,
+                end: selection_stop,
+            });
         }
     }
     fn update_text_layout(&mut self) {
@@ -478,6 +484,11 @@ impl TextInput {
             attrs = attrs.weight(font_weight);
         }
         AttrsList::new(attrs)
+    }
+
+    fn select_word(&mut self) {
+        println!("Selecting word");
+        self.update_selection(1, 5);
     }
 
     fn select_all(&mut self, cx: &mut EventCx) {
@@ -852,16 +863,19 @@ impl View for TextInput {
                 } else {
                     cx.update_active(self.id());
                     cx.app_state_mut().request_layout(self.id());
+                    self.selection = None;
                     self.held = true;
                     self.cursor_glyph_idx = self.get_box_position(event.pos.x, event.pos.y, cx);
+                }
+                if event.count == 2 {
+                    self.select_word()
                 }
                 true
             }
             Event::PointerUp(event) => {
                 cx.app_state_mut().request_layout(self.id());
-                if self.held {
-                    let new_position = self.get_box_position(event.pos.x, event.pos.y, cx);
-                    self.update_selection(self.cursor_glyph_idx, new_position);
+                if self.selection != None {
+                    self.cursor_glyph_idx = self.get_box_position(event.pos.x, event.pos.y, cx);
                 }
                 self.held = false;
                 true
@@ -878,7 +892,7 @@ impl View for TextInput {
                     return EventPropagation::Continue;
                 }
                 false
-            },
+            }
             _ => false,
         };
 
