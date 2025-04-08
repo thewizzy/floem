@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use web_time::{Duration, Instant};
 
 use peniko::kurbo::{Point, Rect, Size};
+use zeroize::Zeroize;
 
 use crate::{
     context::{EventCx, UpdateCx},
@@ -55,12 +56,16 @@ prop_extractor! {
 struct BufferState {
     buffer: RwSignal<String>,
     last_buffer: String,
+    secure: bool,
 }
 
 impl BufferState {
     fn update(&mut self, update: impl FnOnce(&mut String)) {
         self.buffer.update(|s| {
             update(s);
+            if self.secure {
+                self.last_buffer.zeroize();
+            }
             self.last_buffer = s.clone();
         });
     }
@@ -71,6 +76,11 @@ impl BufferState {
 
     fn with_untracked<T>(&self, f: impl FnOnce(&String) -> T) -> T {
         self.buffer.with_untracked(f)
+    }
+
+    fn clear(&mut self) {
+        self.buffer.get().zeroize();
+        self.last_buffer.zeroize();
     }
 }
 
@@ -109,6 +119,7 @@ pub struct TextInput {
     cursor_width: f64, // TODO: make this configurable
     is_focused: bool,
     last_cursor_action_on: Instant,
+    secure: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -146,6 +157,7 @@ pub fn text_input(buffer: RwSignal<String>) -> TextInput {
         buffer: BufferState {
             buffer,
             last_buffer: buffer.get_untracked(),
+            secure: false,
         },
         text_buf: None,
         text_node: None,
@@ -164,6 +176,7 @@ pub fn text_input(buffer: RwSignal<String>) -> TextInput {
         height: 0.0,
         is_focused: false,
         last_cursor_action_on: Instant::now(),
+        secure: false,
     }
     .keyboard_navigatable()
     .on_event_stop(EventListener::FocusGained, move |_| {
@@ -173,6 +186,59 @@ pub fn text_input(buffer: RwSignal<String>) -> TextInput {
         is_focused.set(false);
     })
     .class(TextInputClass)
+}
+
+/// Secure Text Input View
+pub fn secure_text_input(buffer: RwSignal<String>) -> TextInput {
+    let id = ViewId::new();
+    let is_focused = create_rw_signal(false);
+
+    {
+        create_effect(move |_| {
+            let text = buffer.get();
+            id.update_state((text, is_focused.get()));
+        });
+    }
+
+    TextInput {
+        id,
+        cursor_glyph_idx: 0,
+        placeholder_text: None,
+        placeholder_buff: None,
+        placeholder_style: Default::default(),
+        selection_style: Default::default(),
+        buffer: BufferState {
+            buffer,
+            last_buffer: buffer.get_untracked(),
+            secure: true,
+        },
+        text_buf: None,
+        text_node: None,
+        clipped_text: None,
+        clip_txt_buf: None,
+        style: Default::default(),
+        font: FontProps::default(),
+        cursor_x: 0.0,
+        selection: None,
+        glyph_max_size: Size::ZERO,
+        clip_start_idx: 0,
+        clip_offset_x: 0.0,
+        clip_start_x: 0.0,
+        cursor_width: 1.0,
+        width: 0.0,
+        height: 0.0,
+        is_focused: false,
+        last_cursor_action_on: Instant::now(),
+        secure: true,
+    }
+        .keyboard_navigatable()
+        .on_event_stop(EventListener::FocusGained, move |_| {
+            is_focused.set(true);
+        })
+        .on_event_stop(EventListener::FocusLost, move |_| {
+            is_focused.set(false);
+        })
+        .class(TextInputClass)
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -250,23 +316,39 @@ impl TextInput {
     fn move_cursor(&mut self, move_kind: Movement, direction: Direction) -> bool {
         match (move_kind, direction) {
             (Movement::Glyph, Direction::Left) => {
-                let untracked_buffer = self.buffer.get_untracked();
+                let mut untracked_buffer = self.buffer.get_untracked();
                 let mut grapheme_iter = untracked_buffer[..self.cursor_glyph_idx].graphemes(true);
                 match grapheme_iter.next_back() {
-                    None => false,
+                    None => {
+                        if self.secure {
+                            untracked_buffer.zeroize();
+                        };
+                        false
+                    },
                     Some(prev_character) => {
                         self.cursor_glyph_idx -= prev_character.len();
+                        if self.secure {
+                            untracked_buffer.zeroize();
+                        };
                         true
                     }
                 }
             }
             (Movement::Glyph, Direction::Right) => {
-                let untracked_buffer = self.buffer.get_untracked();
+                let mut untracked_buffer = self.buffer.get_untracked();
                 let mut grapheme_iter = untracked_buffer[self.cursor_glyph_idx..].graphemes(true);
                 match grapheme_iter.next() {
-                    None => false,
+                    None => {
+                        if self.secure {
+                            untracked_buffer.zeroize();
+                        };
+                        false
+                    },
                     Some(next_character) => {
                         self.cursor_glyph_idx += next_character.len();
+                        if self.secure {
+                            untracked_buffer.zeroize();
+                        };
                         true
                     }
                 }
@@ -342,14 +424,15 @@ impl TextInput {
             .hit_point(Point::new(clip_start_x + node_width, 0.0))
             .index;
 
-        let new_text = self
-            .buffer
-            .get_untracked()
+        let mut buf_text = self.buffer.get_untracked();
+        let new_text = buf_text
             .chars()
             .skip(clip_start)
             .take(clip_end - clip_start)
             .collect();
-
+        if self.secure {
+            buf_text.zeroize();
+        }
         self.cursor_x -= clip_start_x;
         self.clip_start_idx = clip_start;
         self.clip_start_x = clip_start_x;
@@ -581,22 +664,23 @@ impl TextInput {
             }
             TextCommand::Copy => {
                 if let Some(selection) = &self.selection {
-                    let selection_txt = self
-                        .buffer
-                        .get_untracked()
+                    let mut buf_txt = self.buffer.get_untracked();
+                    let selection_txt = buf_txt
                         .chars()
                         .skip(selection.start)
                         .take(selection.end - selection.start)
                         .collect();
                     let _ = Clipboard::set_contents(selection_txt);
+                    if self.secure {
+                        buf_txt.zeroize();
+                    }
                 }
                 true
             }
             TextCommand::Cut => {
                 if let Some(selection) = &self.selection {
-                    let selection_txt = self
-                        .buffer
-                        .get_untracked()
+                    let mut buf_txt = self.buffer.get_untracked();
+                    let selection_txt = buf_txt
                         .chars()
                         .skip(selection.start)
                         .take(selection.end - selection.start)
@@ -605,6 +689,10 @@ impl TextInput {
 
                     self.buffer
                         .update(|buf| replace_range(buf, selection.clone(), None));
+
+                    if self.secure {
+                        buf_txt.zeroize();
+                    }
 
                     self.cursor_glyph_idx = selection.start;
                     self.selection = None;
@@ -724,14 +812,19 @@ impl TextInput {
             }
             Key::Named(NamedKey::End) => {
                 if event.modifiers.contains(Modifiers::SHIFT) {
+                    let mut buf = self.buffer.get_untracked();
+                    let len = buf.len();
+                    if self.secure {
+                        buf.zeroize();
+                    }
                     match &self.selection {
                         Some(selection_value) => self.update_selection(
                             selection_value.start,
-                            self.buffer.get_untracked().len(),
+                            len,
                         ),
                         None => self.update_selection(
                             self.cursor_glyph_idx,
-                            self.buffer.get_untracked().len(),
+                            len,
                         ),
                     }
                 } else {
@@ -894,6 +987,10 @@ impl TextInput {
             .to_rounded_rect(border_radius);
         cx.fill(&selection_rect, &cursor_color, 0.0);
     }
+
+    fn clear_buffer(&mut self) {
+        self.buffer.clear();
+    }
 }
 
 fn replace_range(buff: &mut String, del_range: Range<usize>, replacement: Option<&str>) {
@@ -970,8 +1067,10 @@ impl View for TextInput {
     }
 
     fn debug_name(&self) -> std::borrow::Cow<'static, str> {
-        format!("TextInput: {:?}", self.buffer.get_untracked()).into()
-    }
+        if self.secure {
+            print!("TextInput: <SECURE FIELD>").into()
+        }
+        format!("TextInput: {:?}", self.buffer.get_untracked()).into()    }
 
     fn update(&mut self, _cx: &mut UpdateCx, state: Box<dyn Any>) {
         if let Ok(state) = state.downcast::<(String, bool)>() {
